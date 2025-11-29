@@ -1,547 +1,408 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-alpha_zones_app.py
+# scripts/alpha_zones_app.py
+#
+# ACTIVOS-ARGENTINA — Viewer de Zonas Precio / Riesgo
+# ---------------------------------------------------
+# Esta app:
+# - Lee SOLO el archivo data/processed/signals_zones_latest.csv
+# - NO depende de trend_metrics.csv, risk_scores_v3.csv ni vat3_metrics_v3.csv
+# - Muestra:
+#     * Resumen general de señales en la fecha seleccionada
+#     * Pestañas por tipo de señal (descuento PREMIUM, SEMI, violento, sobre-extensión, todas)
+#     * Filtros por fecha, bucket de riesgo (score_total), mínimo descuento estimado y umbral de sobre-extensión
+#
+# IMPORTANTE:
+# - Este viewer muestra estadísticas sobre señales PRE-CALCULADAS.
+# - El motor de cálculo permanece en el repo principal (no visible aquí).
 
-Aplicación Streamlit para visualizar:
-- Tendencia (trend_metrics.csv)
-- Riesgo (risk_scores_v3.csv + vat3_metrics_v3.csv)
-- Zonas/Señales:
-    * Descuento tranquilo PREMIUM (adaptativo)
-    * Descuento tranquilo SEMI (adaptativo)
-    * Descuento violento con riesgo elevado
-    * Sobre-extensión alcista
-- Métrica discount_risk_ratio (descuento / riesgo)
-- Pequeños knobs de ajuste:
-    * Mínimo descuento vs MA60
-    * Umbral de sobre-extensión vs MA60
-    * Relajar umbrales de score_total y VAT3_norm
+from __future__ import annotations
 
-Pensado para correr desde la raíz del proyecto:
+from pathlib import Path
+from typing import Tuple
 
-    cd /home/diego/projects/activos-argentina-viewer
-    streamlit run scripts/alpha_zones_app.py
-
-Requisitos:
-    pip install streamlit pandas numpy
-"""
-
-import os
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --------------------------------------------------------------------
-# CONFIGURACIÓN BÁSICA
-# --------------------------------------------------------------------
 
-# Cambiá esta contraseña si querés proteger el acceso local.
-# En Streamlit Cloud, la seguridad real la da la allow-list de emails.
-APP_PASSWORD = "activos2025"
-
-TREND_PATH = "data/processed/trend_metrics.csv"
-RISK_PATH = "data/processed/risk_scores_v3.csv"
-VAT_PATH = "data/processed/vat3_metrics_v3.csv"
+# ------------------------------------------------------------------
+# Configuración básica de la página
+# ------------------------------------------------------------------
+st.set_page_config(
+    page_title="ACTIVOS-ARGENTINA — Viewer de Zonas Precio / Riesgo",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
-# --------------------------------------------------------------------
-# UTILIDADES
-# --------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Utilidades de carga y preparación de datos
+# ------------------------------------------------------------------
+DATA_PATH = Path("data") / "processed" / "signals_zones_latest.csv"
 
-def check_password() -> bool:
+
+@st.cache_data(show_spinner=True)
+def load_signals(path: Path) -> pd.DataFrame:
+    """Carga el archivo de señales pre-calculadas.
+
+    Se espera un CSV con columnas:
+    - date
+    - ticker
+    - trend_label
+    - dist_MA60_pct  (distancia vs MA60, en fracción: 0.12 = 12%)
+    - score_total
+    - VAT3_norm
+    - signal_type
     """
-    Pequeño control de acceso.
-    No es seguridad fuerte, pero evita acceso casual.
-    """
-    def password_entered():
-        if st.session_state["password"] == APP_PASSWORD:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state:
-        st.text("Acceso restringido")
-        st.text_input(
-            "Ingresá la contraseña:",
-            type="password",
-            on_change=password_entered,
-            key="password",
-        )
-        return False
-
-    if not st.session_state["password_correct"]:
-        st.text("Contraseña incorrecta. Volvé a intentar.")
-        st.text_input(
-            "Ingresá la contraseña:",
-            type="password",
-            on_change=password_entered,
-            key="password",
-        )
-        return False
-
-    return True
-
-
-@st.cache_data
-def load_csv_with_date(path: str, date_col: str = "date") -> pd.DataFrame:
-    """Leer CSV y parsear la columna de fecha con cache."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No se encontró el archivo: {path}")
-
     df = pd.read_csv(path)
-    if date_col not in df.columns:
-        raise ValueError(f"El archivo {path} no tiene columna '{date_col}'.")
 
-    df[date_col] = pd.to_datetime(df[date_col])
+    # Normalizamos tipos
+    df["date"] = pd.to_datetime(df["date"])
+    numeric_cols = ["dist_MA60_pct", "score_total", "VAT3_norm"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Definimos un "bucket" de riesgo en base a score_total
+    def score_bucket(score: float) -> str:
+        if pd.isna(score):
+            return "ND"
+        if score < 20:
+            return "Muy bajo (0–20)"
+        if score < 40:
+            return "Bajo (20–40)"
+        if score < 60:
+            return "Medio (40–60)"
+        if score < 80:
+            return "Alto (60–80)"
+        return "Muy alto (≥80)"
+
+    df["score_bucket"] = df["score_total"].apply(score_bucket)
+
+    # Estimamos un "descuento_pct" usando la distancia a MA60:
+    # - Si dist_MA60_pct < 0 → precio por debajo de MA60: tomamos |dist| como descuento.
+    # - Si dist_MA60_pct ≥ 0 → sobre-extensión alcista: descuento = 0.
+    df["discount_pct"] = np.where(
+        df["dist_MA60_pct"] < 0,
+        -df["dist_MA60_pct"] * 100.0,
+        0.0,
+    )
+
+    # También dejamos dist_MA60_pct en porcentaje para mostrarlo más cómodo
+    df["dist_MA60_pct"] = df["dist_MA60_pct"] * 100.0
+
     return df
 
 
-def get_common_dates(dfs) -> list:
-    """Obtener lista de fechas comunes a todos los dataframes (como datetime.date)."""
-    common = None
-    for df in dfs:
-        dates = set(df["date"].dropna().dt.date.unique())
-        if common is None:
-            common = dates
-        else:
-            common = common.intersection(dates)
+def filter_by_date_and_bucket(
+    df: pd.DataFrame, target_date: pd.Timestamp, bucket: str
+) -> pd.DataFrame:
+    """Filtra por fecha objetivo y bucket de riesgo."""
+    df_date = df[df["date"].dt.date == target_date.date()].copy()
 
-    if not common:
-        return []
-    return sorted(common)
+    if bucket != "Todos":
+        df_date = df_date[df_date["score_bucket"] == bucket].copy()
+
+    return df_date
 
 
-def merge_risk_vat(risk_df: pd.DataFrame, vat_df: pd.DataFrame) -> pd.DataFrame:
-    """Unir riesgo + VAT3."""
-    merged = pd.merge(
-        risk_df,
-        vat_df[["date", "ticker", "VAT3_norm"]],
-        on=["date", "ticker"],
-        how="left"
-    )
-    return merged
-
-
-def build_latest_signals(
-    trend_df: pd.DataFrame,
-    risk_vat_df: pd.DataFrame,
-    target_date: pd.Timestamp,
+def apply_additional_filters(
+    df: pd.DataFrame,
     min_discount_pct: float,
     overext_threshold_pct: float,
-    relax_score: float,
-    relax_vat: float,
 ) -> pd.DataFrame:
+    """Aplica filtros adicionales comunes.
+
+    - min_discount_pct: descuento mínimo estimado (solo relevante para zonas de descuento).
+    - overext_threshold_pct: umbral mínimo de sobre-extensión vs MA60
+      (relevante para la pestaña de sobre-extensión).
     """
-    Construir señales para la fecha objetivo con lógica adaptativa y knobs:
+    df = df.copy()
 
-    - descuento_tranquilo_premium
-    - descuento_tranquilo_semi
-    - descuento_violento_alto_riesgo
-    - sobre_extension_alcista
+    # Filtro de descuento mínimo: dejamos pasar señales cuyo "descuento_pct"
+    # sea al menos el valor definido.
+    if "discount_pct" in df.columns:
+        df = df[df["discount_pct"] >= min_discount_pct]
 
-    Parámetros:
-    - min_discount_pct: mínimo descuento vs MA60 (ej. 0.0 → cualquier valor < 0).
-    - overext_threshold_pct: umbral de sobre-extensión (> este %).
-    - relax_score: puntos adicionales para score_p50/p75.
-    - relax_vat: extra permitido en VAT3_norm p50/p75.
+    # El filtro de sobre-extensión se aplicará después por pestaña, para no
+    # eliminar señales de otras categorías que no dependen de MA60.
+    return df, overext_threshold_pct
 
-    Incluye discount_pct y discount_risk_ratio.
-    """
-    trend_last = trend_df[trend_df["date"] == target_date].copy()
-    risk_last = risk_vat_df[
-        (risk_vat_df["date"] == target_date) & (risk_vat_df["status"] == "OK")
-    ].copy()
 
-    if len(trend_last) == 0 or len(risk_last) == 0:
-        return pd.DataFrame()
+def format_percent(x: float) -> str:
+    if pd.isna(x):
+        return "-"
+    return f"{x:.2f} %"
 
-    # Umbrales adaptativos
-    score_series = risk_last["score_total"].dropna()
-    vat_series = risk_last["VAT3_norm"].dropna()
-    if len(score_series) == 0 or len(vat_series) == 0:
-        return pd.DataFrame()
 
-    score_p50, score_p75 = np.percentile(score_series, [50, 75])
-    vat_p50, vat_p75 = np.percentile(vat_series, [50, 75])
+def format_number(x: float) -> str:
+    if pd.isna(x):
+        return "-"
+    return f"{x:,.2f}"
 
-    # Aplicar relajación de umbrales
-    score_p50_adj = score_p50 + relax_score
-    score_p75_adj = score_p75 + relax_score
-    vat_p50_adj = vat_p50 + relax_vat
-    vat_p75_adj = vat_p75 + relax_vat
 
-    merged_last = pd.merge(
-        trend_last,
-        risk_last[["date", "ticker", "score_total", "VAT3_norm", "status"]],
-        on=["date", "ticker"],
-        how="inner",
-    )
+def prepare_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepara el DataFrame para mostrar en la tabla principal."""
+    if df.empty:
+        return df
 
-    if len(merged_last) == 0:
-        return pd.DataFrame()
+    df = df.copy()
 
-    # Descuento y ratio descuento/riesgo
-    min_disc_dec = min_discount_pct / 100.0
-    overext_dec = overext_threshold_pct / 100.0
-
-    merged_last["discount_pct"] = np.where(
-        merged_last["dist_MA60_pct"] <= -min_disc_dec,
-        -merged_last["dist_MA60_pct"],
-        0.0,
-    )
-    eps = 1e-6
-    merged_last["risk_norm"] = merged_last["score_total"] / 100.0
-    merged_last["discount_risk_ratio"] = np.where(
-        merged_last["discount_pct"] > 0,
-        merged_last["discount_pct"] / (merged_last["risk_norm"] + eps),
-        np.nan,
-    )
-
-    base_descuento = (
-        (merged_last["trend_label"] == "Alcista") &
-        (merged_last["dist_MA60_pct"] <= -min_disc_dec)
-    )
-
-    mask_desc_tranquilo_premium = (
-        base_descuento &
-        (merged_last["score_total"] <= score_p50_adj) &
-        (merged_last["VAT3_norm"] <= vat_p50_adj)
-    )
-
-    mask_desc_tranquilo_semi = (
-        base_descuento &
-        (merged_last["score_total"] <= score_p75_adj) &
-        (merged_last["VAT3_norm"] <= vat_p75_adj) &
-        (~mask_desc_tranquilo_premium)
-    )
-
-    mask_desc_violento = (
-        base_descuento &
-        (merged_last["score_total"] >= 60) &
-        (merged_last["VAT3_norm"] >= 2.0)
-    )
-
-    mask_sobre_ext = (
-        (merged_last["trend_label"] == "Alcista") &
-        (merged_last["dist_MA60_pct"] > overext_dec) &
-        (merged_last["score_total"] >= 55)
-    )
-
-    signals = []
-
-    def _add(mask, label):
-        df_sig = merged_last[mask].copy()
-        if len(df_sig) == 0:
-            return
-        df_sig["signal_type"] = label
-        signals.append(df_sig)
-
-    _add(mask_desc_tranquilo_premium, "descuento_tranquilo_premium")
-    _add(mask_desc_tranquilo_semi, "descuento_tranquilo_semi")
-    _add(mask_desc_violento, "descuento_violento_alto_riesgo")
-    _add(mask_sobre_ext, "sobre_extension_alcista")
-
-    if not signals:
-        return pd.DataFrame()
-
-    signals_all = pd.concat(signals, ignore_index=True)
-    # Guardar (por compatibilidad con el pipeline principal)
-    outdir = "data/processed"
-    os.makedirs(outdir, exist_ok=True)
-    out_path = os.path.join(outdir, "signals_zones_latest.csv")
-    cols_out = [
-        "date",
+    # Orden sugerida de columnas si existen
+    col_order = [
         "ticker",
         "trend_label",
-        "dist_MA60_pct",
+        "signal_type",
         "score_total",
         "VAT3_norm",
+        "dist_MA60_pct",
         "discount_pct",
-        "discount_risk_ratio",
-        "signal_type",
     ]
-    cols_out = [c for c in cols_out if c in signals_all.columns]
-    signals_all[cols_out].to_csv(out_path, index=False)
+    cols_present = [c for c in col_order if c in df.columns]
+    other_cols = [c for c in df.columns if c not in cols_present]
 
-    return signals_all
+    df = df[cols_present + other_cols]
 
+    # Formateo amigable para porcentajes y números
+    if "dist_MA60_pct" in df.columns:
+        df["dist_MA60_pct"] = df["dist_MA60_pct"].apply(format_percent)
+    if "discount_pct" in df.columns:
+        df["discount_pct"] = df["discount_pct"].apply(format_percent)
+    if "score_total" in df.columns:
+        df["score_total"] = df["score_total"].apply(format_number)
+    if "VAT3_norm" in df.columns:
+        df["VAT3_norm"] = df["VAT3_norm"].apply(format_number)
 
-def format_pct(x: float) -> str:
-    """Formato porcentaje simple."""
-    if pd.isna(x):
-        return ""
-    return f"{x*100:.2f} %"
-
-
-def format_ratio(x: float) -> str:
-    """Formato ratio simple."""
-    if pd.isna(x):
-        return ""
-    return f"{x:.2f}"
+    return df
 
 
-# --------------------------------------------------------------------
-# APP PRINCIPAL
-# --------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Interfaz
+# ------------------------------------------------------------------
+def sidebar_controls(df: pd.DataFrame) -> Tuple[pd.Timestamp, str, float, float]:
+    """Construye los controles de la barra lateral y devuelve sus valores."""
+    st.sidebar.header("Parámetros")
 
-def main():
-    st.set_page_config(
-        page_title="ACTIVOS-ARGENTINA — Zonas Precio/Riesgo",
-        layout="wide",
+    # 1) Fecha objetivo
+    all_dates = sorted(df["date"].dt.date.unique())
+    default_date = all_dates[-1] if all_dates else None
+
+    selected_date = st.sidebar.selectbox(
+        "Fecha objetivo",
+        options=all_dates,
+        index=len(all_dates) - 1 if all_dates else 0,
+        format_func=lambda d: d.strftime("%Y-%m-%d"),
+    )
+    selected_date = pd.to_datetime(selected_date)
+
+    # 2) Filtro de riesgo (score_total → bucket)
+    st.sidebar.subheader("Filtro de riesgo\n(score_total)")
+    bucket_options = ["Todos"] + sorted(df["score_bucket"].unique().tolist())
+    selected_bucket = st.sidebar.selectbox("Filtro de bucket:", options=bucket_options)
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Filtros adicionales")
+
+    # 3) Mínimo descuento estimado
+    min_discount = st.sidebar.slider(
+        "Mínimo descuento (%)",
+        min_value=0.0,
+        max_value=10.0,
+        value=0.0,
+        step=0.25,
+        help="Descuento estimado mínimo vs MA60 para considerar una señal (solo aplica a zonas de descuento).",
     )
 
-    if not check_password():
-        st.stop()
+    # 4) Umbral de sobre-extensión vs MA60
+    overext_threshold = st.sidebar.slider(
+        "Umbral de sobre-extensión vs MA60 (%)",
+        min_value=8.0,
+        max_value=20.0,
+        value=12.0,
+        step=0.5,
+        help="Distancia mínima vs MA60 para considerar una sobre-extensión alcista.",
+    )
 
-    st.title("ACTIVOS-ARGENTINA — Mapa de Zonas Precio / Riesgo")
-    st.caption("Visualización privada de riesgo, tendencia y señales estadísticas.")
+    return selected_date, selected_bucket, min_discount, overext_threshold
 
+
+def main() -> None:
+    st.title("ACTIVOS-ARGENTINA — Viewer de Zonas Precio / Riesgo")
+    st.caption(
+        "Visualización privada de señales estadísticas pre-calculadas. "
+        "El motor de cálculo permanece en el repositorio principal (no visible aquí)."
+    )
+
+    # ------------------------------------------------------------------
     # Carga de datos
+    # ------------------------------------------------------------------
     try:
-        trend_df = load_csv_with_date(TREND_PATH, date_col="date")
-        risk_df = load_csv_with_date(RISK_PATH, date_col="date")
-        vat_df = load_csv_with_date(VAT_PATH, date_col="date")
-    except Exception as e:
-        st.error(f"Error al cargar archivos: {e}")
+        df_signals = load_signals(DATA_PATH)
+    except FileNotFoundError:
+        st.error(
+            f"Error al cargar archivos: No se encontró el archivo: {DATA_PATH.as_posix()}"
+        )
         st.stop()
 
-    risk_vat_df = merge_risk_vat(risk_df, vat_df)
-
-    # Fechas comunes
-    common_dates = get_common_dates([trend_df, risk_vat_df])
-    if not common_dates:
-        st.error("No se encontraron fechas comunes entre los datasets.")
+    if df_signals.empty:
+        st.warning("No hay datos de señales disponibles en el archivo actual.")
         st.stop()
 
-    # Sidebar — selección de fecha, filtro de riesgo y knobs
-    with st.sidebar:
-        st.header("Parámetros")
+    # ------------------------------------------------------------------
+    # Controles de la barra lateral
+    # ------------------------------------------------------------------
+    (
+        selected_date,
+        selected_bucket,
+        min_discount_pct,
+        overext_threshold_pct,
+    ) = sidebar_controls(df_signals)
 
-        date_selected = st.selectbox(
-            "Fecha objetivo",
-            options=common_dates,
-            index=len(common_dates) - 1,
-            format_func=lambda d: d.strftime("%Y-%m-%d"),
+    # ------------------------------------------------------------------
+    # Filtros principales
+    # ------------------------------------------------------------------
+    df_filtered = filter_by_date_and_bucket(df_signals, selected_date, selected_bucket)
+    df_filtered, overext_threshold_pct = apply_additional_filters(
+        df_filtered, min_discount_pct, overext_threshold_pct
+    )
+
+    # Si no hay señales después de filtros, avisamos y salimos
+    if df_filtered.empty:
+        st.info(
+            "No hay señales para los filtros actuales. "
+            "Ajustá la fecha, el bucket de riesgo o el mínimo de descuento para ver resultados."
         )
+        st.stop()
 
-        st.subheader("Filtro de riesgo (score_total)")
-        risk_filter = st.selectbox(
-            "Filtro de bucket:",
-            options=[
-                "Todos",
-                "Muy bajo (0–20)",
-                "Moderado (20–40)",
-                "Elevado (40–60)",
-                "Muy elevado (>=60)",
-            ],
-        )
-
-        st.markdown("---")
-        st.subheader("Ajustes finos (no rompen el modelo)")
-
-        min_discount_pct = st.slider(
-            "Mínimo descuento vs MA60 (%)",
-            min_value=0.0,
-            max_value=10.0,
-            value=0.0,
-            step=0.5,
-            help="Requiere que el precio esté al menos este % por debajo de MA60 para considerarse 'en descuento'.",
-        )
-
-        overext_threshold_pct = st.slider(
-            "Umbral de sobre-extensión vs MA60 (%)",
-            min_value=8.0,
-            max_value=20.0,
-            value=12.0,
-            step=0.5,
-            help="Precio por encima de MA60 a partir del cual se considera 'sobre-extensión alcista'.",
-        )
-
-        relax_score = st.slider(
-            "Relajar umbrales de riesgo (score_total, puntos)",
-            min_value=0.0,
-            max_value=10.0,
-            value=0.0,
-            step=1.0,
-            help="Permite incluir activos con score_total algo mayor que los percentiles P50/P75 base.",
-        )
-
-        relax_vat = st.slider(
-            "Relajar umbrales de colas (VAT3_norm)",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.0,
-            step=0.05,
-            help="Permite incluir activos con VAT3_norm algo mayor que los percentiles P50/P75 base.",
-        )
-
-    target_date = pd.to_datetime(date_selected)
-
-    # Resumen general
+    # ------------------------------------------------------------------
+    # 1. Resumen general
+    # ------------------------------------------------------------------
     st.markdown("### 1. Resumen general")
 
-    col1, col2, col3 = st.columns(3)
-
-    df_trend_last = trend_df[trend_df["date"] == target_date].copy()
-    df_risk_last = risk_vat_df[
-        (risk_vat_df["date"] == target_date) & (risk_vat_df["status"] == "OK")
-    ].copy()
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        st.metric("Activos con tendencia calculada", df_trend_last["ticker"].nunique())
-        st.metric("Activos con riesgo OK", df_risk_last["ticker"].nunique())
+        activos_distintos = df_filtered["ticker"].nunique()
+        st.metric("Activos distintos con señal en la fecha", activos_distintos)
 
     with col2:
-        if len(df_risk_last) > 0:
-            score_mediana = df_risk_last["score_total"].median()
-            st.metric("Mediana score_total", f"{score_mediana:.1f}")
-        if len(df_risk_last) > 0:
-            vat_mediana = df_risk_last["VAT3_norm"].median()
-            st.metric("Mediana VAT3_norm", f"{vat_mediana:.2f}")
+        total_senales = len(df_filtered)
+        st.metric("Cantidad total de señales en la fecha", total_senales)
 
     with col3:
-        trend_counts = df_trend_last["trend_label"].value_counts()
-        st.write("Tendencias en la fecha:")
-        st.write(trend_counts)
+        med_score = float(df_filtered["score_total"].median())
+        st.metric(
+            "Mediana score_total (sobre universo con señal)",
+            f"{med_score:,.1f}",
+        )
 
-    # Construcción de señales con knobs
-    signals = build_latest_signals(
-        trend_df,
-        risk_vat_df,
-        target_date,
-        min_discount_pct=min_discount_pct,
-        overext_threshold_pct=overext_threshold_pct,
-        relax_score=relax_score,
-        relax_vat=relax_vat,
+    with col4:
+        med_vat3 = float(df_filtered["VAT3_norm"].median())
+        st.metric(
+            "Mediana VAT3_norm (sobre universo con señal)",
+            f"{med_vat3:,.2f}",
+        )
+
+    # Tabla de tendencias entre activos con señal
+    st.markdown("")
+    st.markdown("Tendencias entre activos con señal:")
+
+    trend_counts = (
+        df_filtered.groupby("trend_label")["ticker"].nunique().reset_index(name="count")
     )
+    st.dataframe(trend_counts, use_container_width=True, hide_index=True)
 
+    st.markdown("---")
+
+    # ------------------------------------------------------------------
+    # 2. Señales / Zonas a la fecha seleccionada
+    # ------------------------------------------------------------------
     st.markdown("### 2. Señales / Zonas a la fecha seleccionada")
 
-    if signals.empty:
-        st.info("No se detectaron señales para esta fecha con los umbrales actuales.")
-    else:
-        # Filtro de riesgo
-        if risk_filter != "Todos":
-            if "Muy bajo" in risk_filter:
-                signals = signals[signals["score_total"] < 20]
-            elif "Moderado" in risk_filter:
-                signals = signals[(signals["score_total"] >= 20) & (signals["score_total"] < 40)]
-            elif "Elevado" in risk_filter:
-                signals = signals[(signals["score_total"] >= 40) & (signals["score_total"] < 60)]
-            elif "Muy elevado" in risk_filter:
-                signals = signals[signals["score_total"] >= 60]
+    tab_premium, tab_semi, tab_violento, tab_overext, tab_todas = st.tabs(
+        [
+            "Descuento tranquilo PREMIUM",
+            "Descuento tranquilo SEMI",
+            "Descuento violento (alto riesgo)",
+            "Sobre-extensión alcista",
+            "Todas las señales",
+        ]
+    )
 
-        tabs = st.tabs(
-            [
-                "Descuento tranquilo PREMIUM",
-                "Descuento tranquilo SEMI",
-                "Descuento violento (alto riesgo)",
-                "Sobre-extensión alcista",
-                "Todas las señales",
-            ]
+    # Helper para mostrar tabla + mensaje vacío
+    def show_signals_tab(df_tab: pd.DataFrame, descripcion: str) -> None:
+        st.markdown(descripcion)
+        if df_tab.empty:
+            st.info("No hay activos en esta categoría con los filtros actuales.")
+            return
+        st.dataframe(
+            prepare_df_for_display(df_tab),
+            use_container_width=True,
+            hide_index=True,
         )
 
-        def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
-            """Preparar tabla amigable."""
-            if df.empty:
-                return df
-            df_show = df.copy()
-
-            # Ordenar por ratio en descuentos; por dist_MA60 en sobre-extensión
-            if (df_show["signal_type"] == "sobre_extension_alcista").all():
-                df_show = df_show.sort_values("dist_MA60_pct", ascending=False)
-            elif (df_show["signal_type"] == "descuento_violento_alto_riesgo").all():
-                df_show = df_show.sort_values("dist_MA60_pct", ascending=True)
-            else:
-                if "discount_risk_ratio" in df_show.columns:
-                    df_show = df_show.sort_values("discount_risk_ratio", ascending=False)
-
-            cols = [
-                "ticker",
-                "trend_label",
-                "dist_MA60_pct",
-                "score_total",
-                "VAT3_norm",
-                "discount_pct",
-                "discount_risk_ratio",
-                "signal_type",
-            ]
-            cols = [c for c in cols if c in df_show.columns]
-            df_show = df_show[cols]
-
-            # Formatear porcentaje y ratio
-            if "dist_MA60_pct" in df_show.columns:
-                df_show["dist_MA60_pct"] = df_show["dist_MA60_pct"].apply(format_pct)
-            if "discount_pct" in df_show.columns:
-                df_show["discount_pct"] = df_show["discount_pct"].apply(format_pct)
-            if "discount_risk_ratio" in df_show.columns:
-                df_show["discount_risk_ratio"] = df_show["discount_risk_ratio"].apply(format_ratio)
-
-            return df_show
-
-        with tabs[0]:
-            df_tranq_p = signals[signals["signal_type"] == "descuento_tranquilo_premium"]
-            st.subheader("Descuento tranquilo PREMIUM")
-            st.caption(
-                "Alcista + por debajo de MA60 (>= mínimo descuento configurado) + "
-                "score_total <= P50 ajustado + VAT3_norm <= P50 ajustado (adaptativo por fecha)."
-            )
-            if df_tranq_p.empty:
-                st.info("No hay activos en esta categoría para la fecha seleccionada.")
-            else:
-                st.dataframe(_prepare_df(df_tranq_p), width="stretch")
-
-        with tabs[1]:
-            df_tranq_s = signals[signals["signal_type"] == "descuento_tranquilo_semi"]
-            st.subheader("Descuento tranquilo SEMI")
-            st.caption(
-                "Alcista + por debajo de MA60 (>= mínimo descuento configurado) + "
-                "score_total <= P75 ajustado + VAT3_norm <= P75 ajustado, "
-                "excluyendo la categoría PREMIUM (adaptativo por fecha)."
-            )
-            if df_tranq_s.empty:
-                st.info("No hay activos en esta categoría para la fecha seleccionada.")
-            else:
-                st.dataframe(_prepare_df(df_tranq_s), width="stretch")
-
-        with tabs[2]:
-            df_viol = signals[signals["signal_type"] == "descuento_violento_alto_riesgo"]
-            st.subheader("Descuento violento con riesgo elevado")
-            st.caption(
-                "Alcista + por debajo de MA60 (>= mínimo descuento configurado) + "
-                "score_total ≥ 60 + VAT3_norm ≥ 2.0."
-            )
-            if df_viol.empty:
-                st.info("No hay activos en esta categoría para la fecha seleccionada.")
-            else:
-                st.dataframe(_prepare_df(df_viol), width="stretch")
-
-        with tabs[3]:
-            df_ext = signals[signals["signal_type"] == "sobre_extension_alcista"]
-            st.subheader("Sobre-extensión alcista")
-            st.caption(
-                "Alcista + muy por encima de MA60 (umbral configurable) + score_total ≥ 55."
-            )
-            if df_ext.empty:
-                st.info("No hay activos en esta categoría para la fecha seleccionada.")
-            else:
-                st.dataframe(_prepare_df(df_ext), width="stretch")
-
-        with tabs[4]:
-            st.subheader("Todas las señales combinadas")
-            st.dataframe(_prepare_df(signals), width="stretch")
-
-    st.markdown("### 3. Vista de depuración (opcional)")
-
-    with st.expander("Ver datos crudos combinados (riesgo + tendencia)", expanded=False):
-        merged_last = pd.merge(
-            df_trend_last,
-            df_risk_last[["date", "ticker", "score_total", "VAT3_norm", "status"]],
-            on=["date", "ticker"],
-            how="left",
+    # 2.1 Descuento tranquilo PREMIUM
+    with tab_premium:
+        df_prem = df_filtered[df_filtered["signal_type"] == "descuento_tranquilo_premium"]
+        desc = (
+            "**Descuento tranquilo PREMIUM**\n\n"
+            "Alcista + por debajo de MA60 (descuento moderado/alto) + "
+            "score_total elevado (bajo riesgo relativo) + colas suaves. "
+            "Ordenadas por mejor relación descuento / riesgo."
         )
-        st.dataframe(merged_last.head(100), width="stretch")
+        show_signals_tab(df_prem, desc)
+
+    # 2.2 Descuento tranquilo SEMI
+    with tab_semi:
+        df_semi = df_filtered[df_filtered["signal_type"] == "descuento_tranquilo_semi"]
+        desc = (
+            "**Descuento tranquilo SEMI**\n\n"
+            "Alcista + por debajo de MA60 + score_total medio/alto. "
+            "Condiciones algo más laxas que la categoría PREMIUM."
+        )
+        show_signals_tab(df_semi, desc)
+
+    # 2.3 Descuento violento (alto riesgo)
+    with tab_violento:
+        df_viol = df_filtered[
+            df_filtered["signal_type"] == "descuento_violento_alto_riesgo"
+        ]
+        desc = (
+            "**Descuento violento con riesgo elevado**\n\n"
+            "Alcista + fuerte descuento vs MA60 + score_total muy alto "
+            "(riesgo elevado / volatilidad relevante)."
+        )
+        show_signals_tab(df_viol, desc)
+
+    # 2.4 Sobre-extensión alcista
+    with tab_overext:
+        df_over = df_filtered[df_filtered["signal_type"] == "sobre_extension_alcista"]
+
+        # Aquí sí aplicamos el umbral de sobre-extensión vs MA60:
+        df_over = df_over[df_over["dist_MA60_pct"] >= overext_threshold_pct]
+
+        desc = (
+            "**Sobre-extensión alcista**\n\n"
+            "Alcista + muy por encima de MA60 (umbral configurable) + "
+            "riesgo medio/alto. Posibles candidatos a toma de ganancias "
+            "o monitoreo cercano."
+        )
+        show_signals_tab(df_over, desc)
+
+    # 2.5 Todas las señales
+    with tab_todas:
+        desc = (
+            "**Todas las señales combinadas**\n\n"
+            "Se muestran todas las señales para la fecha y filtros actuales, "
+            "independientemente del tipo de zona."
+        )
+        show_signals_tab(df_filtered, desc)
+
+    st.markdown("---")
+    st.caption(
+        "Notas: los parámetros y percentiles de riesgo se calculan sobre el universo "
+        "de señales disponibles en el archivo actual. Este viewer no reemplaza el "
+        "análisis fundamental ni constituye recomendación de inversión."
+    )
 
 
 if __name__ == "__main__":
