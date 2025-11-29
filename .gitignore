@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+.venv_viewer
+.cache/
+
+# Por defecto, ignorar todos los CSV de data/processed
+data/processed/*
+# EXCEPCIÓN: versionar solo las señales pre-calculadas
+!data/processed/signals_zones_latest.csv
