@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -115,6 +115,158 @@ def prepare_df(df: pd.DataFrame) -> pd.DataFrame:
     return df_disp
 
 
+def render_help() -> None:
+    """Guía rápida de interpretación del viewer (se muestra en un expander)."""
+    with st.expander("¿Cómo usar este viewer? Guía rápida", expanded=False):
+        st.markdown(
+            """
+### 1. Idea general
+
+Este viewer muestra **señales estadísticas pre-calculadas** para el universo
+de activos de *ACTIVOS-ARGENTINA*.  
+El motor de cálculo vive en otro proyecto y **no está expuesto aquí**.
+
+Pensalo como un mapa de “zonas de precio / riesgo” que te ayuda a:
+
+- Detectar **sobre-extensiones alcistas** (posibles candidatos a toma de ganancias
+  o monitoreo cercano).
+- Ver **descuentos tranquilos** (escenarios de posible entrada, siempre
+  sujetos a validación fundamental).
+- Filtrar por **riesgo total** y por **condiciones mínimas** de descuento.
+
+> Nada de lo que ves aquí constituye una recomendación de inversión.
+
+---
+
+### 2. Barra lateral (filtros principales)
+
+1. **Fecha objetivo**  
+   - Elegís la fecha para la que querés ver las señales.
+   - Solo se muestran fechas donde el motor generó señales.
+
+2. **Filtro de bucket de riesgo (score_total)**  
+   - *Todos*: muestra todo el universo con señal.
+   - *Bajo / Medio / Alto / Muy alto*: restringe las señales según el
+     bucket de `score_total`.  
+       - *Bajo*: escenarios más tranquilos.
+       - *Muy alto*: escenarios más especulativos / volátiles.
+
+3. **Mínimo descuento (%)**  
+   - Cuando en el futuro exista una métrica de descuento explícita,
+     este slider filtrará solo activos con **descuento mínimo** respecto
+     a su referencia.
+   - Mientras tanto, podés dejarlo en `0.00%` para no filtrar nada
+     adicional.
+
+4. **Umbral de sobre-extensión vs MA60 (%)**  
+   - Define qué tan por encima de la media móvil de 60 ruedas (MA60)
+     debe estar el precio para que consideremos una **sobre-extensión
+     alcista**.
+   - Valores sugeridos:
+     - `12%` (default): sobre-extensión moderada.
+     - `15–20%`: sobre-extensión extrema (bordes).
+
+---
+
+### 3. Bloque “1. Resumen general”
+
+Te da una foto rápida del universo filtrado:
+
+- **Activos distintos con señal**: cuántos tickers tienen al menos una señal.
+- **Cantidad total de señales**: algunas reglas pueden generar
+  más de una señal por ticker.
+- **Mediana de score_total y VAT3_norm**: te ayudan a entender si la
+  fecha está “tranquila” o “cargada” de riesgo.
+- **Tabla de tendencias**: cuántos activos están etiquetados como
+  *Alcista* (u otras tendencias, si se agregan a futuro).
+
+Si este bloque muestra un mensaje azul informando que no hay señales,
+revisá los filtros: tal vez elegiste una fecha sin señales o
+pusiste filtros demasiado restrictivos.
+
+---
+
+### 4. Bloque “2. Señales / Zonas a la fecha seleccionada”
+
+Hay 5 pestañas:
+
+1. **Descuento tranquilo PREMIUM**  
+   - Escenarios de *descuento moderado/alto* + *buen perfil de riesgo*.
+   - Son candidatos naturales para mirar con calma y luego validar
+     con análisis fundamental.
+
+2. **Descuento tranquilo SEMI**  
+   - Parecido al anterior, pero con condiciones algo más laxas.
+   - Útil para ampliar el radar cuando el universo está muy filtrado.
+
+3. **Descuento violento (alto riesgo)**  
+   - Descuentos fuertes en activos con **riesgo muy elevado**.
+   - Territorio especulativo. Se mira, pero no implica acción.
+
+4. **Sobre-extensión alcista**  
+   - Activos *alcistas* y **muy por encima de la MA60** (según el
+     umbral que definas en el slider).
+   - Pueden ser candidatos a:
+     - Toma parcial de ganancias.
+     - Ajuste de stop.
+     - Monitoreo más cercano.
+
+5. **Todas las señales**  
+   - Muestra el conjunto completo para la fecha, ordenado por
+     `score_total` (de mayor a menor).
+   - Útil como “tablero completo” después de explorar las pestañas
+     anteriores.
+
+En todas las pestañas:
+
+- Las tablas muestran:
+  - `ticker`
+  - `trend_label` (por ahora “Alcista”)
+  - `signal_type`
+  - `score_total`
+  - `VAT3_norm`
+  - `dist_MA60_pct` (distancia a MA60 en %)
+  - `discount_pct` (por ahora placeholder)
+  - `discount_risk_ratio` (placeholder para análisis futuro)
+
+Si una pestaña no tiene resultados, se muestra un mensaje azul aclarando
+que no hay activos para esa categoría con los filtros actuales.
+
+---
+
+### 5. Cómo usar los “bordes” de señal en la práctica
+
+- **Para buscar entradas posibles**  
+  - Mirar primero *Descuento tranquilo PREMIUM* y *SEMI* con:
+    - Bucket de riesgo en `Bajo` o `Medio`.
+    - Umbral de MA60 en su valor por defecto.
+  - Luego, validar esos tickers con tu análisis fundamental.
+
+- **Para controlar toma de ganancias / sobre-extensión**  
+  - Ir a *Sobre-extensión alcista*.
+  - Subir el umbral de MA60 al rango `15–20%` para ver los casos más
+    extremos.
+  - Revisar esos nombres dentro de tu cartera o watchlist.
+
+Siempre el orden es:
+1. Señal cuantitativa → 2. Validación cualitativa → 3. Decisión.
+
+---
+
+### 6. Recordatorio legal
+
+Este viewer:
+
+- No reemplaza el análisis fundamental.
+- No considera tu perfil de riesgo ni tu situación patrimonial.
+- No constituye recomendación de inversión ni asesoramiento financiero.
+
+Tomá todas las salidas como **insumos de análisis**, no como órdenes
+de compra/venta.
+            """
+        )
+
+
 # ---------------------------------------------------------------------------
 # UI principal
 # ---------------------------------------------------------------------------
@@ -131,6 +283,9 @@ def main() -> None:
         "Visualización privada de señales estadísticas pre-calculadas. "
         "El motor de cálculo permanece en el repositorio principal (no visible aquí)."
     )
+
+    # Guía de uso dentro de la app
+    render_help()
 
     # Carga de datos
     try:
