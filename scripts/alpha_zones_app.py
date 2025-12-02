@@ -15,7 +15,6 @@ DATA_FILE = (
     / "signals_zones_latest.csv"
 )
 
-
 # ---------------------------------------------------------------------------
 # Carga y preparación de datos
 # ---------------------------------------------------------------------------
@@ -302,6 +301,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     with st.sidebar:
         st.header("Parámetros")
+
+        # 🔄 Botón para recargar datos (borrar caché)
+        if st.button("🔄 Recargar datos (borrar caché)"):
+            st.cache_data.clear()
+            st.experimental_rerun()
 
         # Fechas disponibles (ordenadas de más reciente a más antigua)
         available_dates = sorted(df["date"].dt.date.unique(), reverse=True)
