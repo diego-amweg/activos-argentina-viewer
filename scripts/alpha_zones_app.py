@@ -1,498 +1,253 @@
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Optional
+# /scripts/alpha_zones_app.py
+import os
+import time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Ruta al CSV dentro del repo del viewer
-DATA_FILE = (
-    Path(__file__).resolve().parents[1]
-    / "data"
-    / "processed"
-    / "signals_zones_latest.csv"
+# =============================
+# Config
+# =============================
+st.set_page_config(page_title="Activos Argentina — Zonas + Ranking", layout="wide")
+
+# Data paths (en el repo viewer)
+DATA_DIR = os.path.join("data", "processed")
+ZONES_PATH = os.path.join(DATA_DIR, "signals_zones_latest.csv")
+RANKING_PATH = os.path.join(DATA_DIR, "multifactor_ranking_v0.csv")
+
+APP_TITLE = "Activos Argentina — Zonas + Ranking (Viewer)"
+DISCLAIMER = (
+    "⚠️ **IMPORTANTE:** Este dashboard **NO es una recomendación** ni asesoramiento financiero. "
+    "Es un **orden de prioridad para mirar tickers** y entender contexto (riesgo/tendencia/zonas). "
+    "Toda decisión debe validarse con análisis adicional y tu propio criterio."
 )
 
-# ---------------------------------------------------------------------------
-# Carga y preparación de datos
-# ---------------------------------------------------------------------------
+# =============================
+# Helpers
+# =============================
+def _file_info(path: str) -> str:
+    if not os.path.exists(path):
+        return "No encontrado"
+    ts = os.path.getmtime(path)
+    # Mostrar en horario local (Streamlit Cloud suele estar en UTC; igual es informativo)
+    return f"Existe • mtime={datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}"
 
-@st.cache_data
-def load_data(path: str) -> pd.DataFrame:
-    """Carga el CSV de señales y agrega columnas auxiliares para el viewer."""
-    df = pd.read_csv(path)
+@st.cache_data(show_spinner=False)
+def _read_csv_cached(path: str) -> pd.DataFrame:
+    # Cachea lectura; se limpia con el botón.
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_csv(path)
 
-    # Tipos
-    df["date"] = pd.to_datetime(df["date"])
+def _safe_to_datetime(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce")
 
-    # dist_MA60_pct viene como proporción (ej: 0.34 = 34%)
-    # Lo pasamos a porcentaje directo para trabajar más intuitivamente
-    df["dist_MA60_pct"] = df["dist_MA60_pct"] * 100.0
+def _as_float(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
 
-    # Por ahora no tenemos verdaderas señales de "descuento".
-    # Definimos discount_pct = 0 para mantener la estructura del viewer.
-    df["discount_pct"] = np.where(df["dist_MA60_pct"] < 0, -df["dist_MA60_pct"], 0.0)
-
-    # Ratio descuento / riesgo (placeholder, útil a futuro)
-    df["discount_risk_ratio"] = np.where(
-        df["discount_pct"] > 0,
-        df["discount_pct"] / df["score_total"].replace(0, np.nan),
-        np.nan,
-    )
-
-    # Buckets de riesgo aproximados, solo para filtro de alto nivel
-    def bucket(score: float) -> str:
-        if pd.isna(score):
-            return "Sin dato"
-        if score < 40:
-            return "Bajo"
-        if score < 60:
-            return "Medio"
-        if score < 80:
-            return "Alto"
-        return "Muy alto"
-
-    df["score_bucket"] = df["score_total"].apply(bucket)
-
-    return df
-
-
-def base_filter(
-    df: pd.DataFrame,
-    target_date,
-    bucket_filter: str,
-    min_discount: float,
-) -> pd.DataFrame:
-    """Aplica filtros comunes: fecha, bucket de riesgo y mínimo descuento."""
-    out = df[df["date"].dt.date == target_date].copy()
-
-    if bucket_filter != "Todos":
-        out = out[out["score_bucket"] == bucket_filter]
-
-    if min_discount > 0:
-        out = out[out["discount_pct"] >= min_discount]
-
-    return out
-
-
-def prepare_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Ordena y formatea columnas para mostrarlas en la tabla principal."""
+def _add_basic_types_zones(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+    df = df.copy()
+    if "date" in df.columns:
+        df["date"] = _safe_to_datetime(df["date"])
+    for col in ["dist_MA60_pct", "score_total", "VAT3_norm", "discount_pct", "discount_risk_ratio"]:
+        if col in df.columns:
+            df[col] = _as_float(df[col])
+    return df
 
-    df_disp = df.copy()
-
-    # Formateo de porcentajes
-    df_disp["dist_MA60_pct"] = df_disp["dist_MA60_pct"].map(
-        lambda x: f"{x:.2f} %"
-    )
-    df_disp["discount_pct"] = df_disp["discount_pct"].map(
-        lambda x: f"{x:.2f} %"
-    )
-
-    # Orden sugerido de columnas
-    cols = [
-        "ticker",
-        "trend_label",
-        "signal_type",
-        "score_total",
-        "VAT3_norm",
-        "dist_MA60_pct",
-        "discount_pct",
-        "date",
-        "discount_risk_ratio",
-        "score_bucket",
+def _add_basic_types_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    if "date" in df.columns:
+        df["date"] = _safe_to_datetime(df["date"])
+    # numéricos típicos del ranking
+    num_cols = [
+        "rank_v0", "score_total_v0", "score_salida_v0",
+        "trend_score_raw", "trend_score_pos",
+        "risk_score_100", "tails_score_100", "liquidity_proxy_score_100",
+        "price_position_score_100", "history_quality_score_100",
+        "close_target", "days_since_same_level",
+        "pos_in_range_60", "pos_in_range_60_score_100",
+        "dist_MA20_pct", "dist_MA60_pct", "dist_MA252_pct",
+        "slope_20_log", "slope_60_log", "slope_252_log",
+        "score_total", "score_vol", "score_tails", "score_illiq", "VAT3_norm",
+        "vol_20d_annual", "vol_60d_annual", "vol_252d_annual", "vol_adaptativa_annual_v3",
+        "pct_days_with_returns",
     ]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = _as_float(df[c])
+    # last_same_level_date
+    if "last_same_level_date" in df.columns:
+        df["last_same_level_date"] = _safe_to_datetime(df["last_same_level_date"])
+    return df
 
-    # Nos quedamos solo con las que existan (por si el CSV cambia en el futuro)
-    cols = [c for c in cols if c in df_disp.columns]
-
-    df_disp = df_disp[cols]
-
-    return df_disp
-
-
-def render_help() -> None:
-    """Guía rápida de interpretación del viewer (se muestra en un expander)."""
-    with st.expander("¿Cómo usar este viewer? Guía rápida", expanded=False):
-        st.markdown(
-            """
-### 1. Idea general
-
-Este viewer muestra **señales estadísticas pre-calculadas** para el universo
-de activos de *ACTIVOS-ARGENTINA*.  
-El motor de cálculo vive en otro proyecto y **no está expuesto aquí**.
-
-Pensalo como un mapa de “zonas de precio / riesgo” que te ayuda a:
-
-- Detectar **sobre-extensiones alcistas** (posibles candidatos a toma de ganancias
-  o monitoreo cercano).
-- Ver **descuentos tranquilos** (escenarios de posible entrada, siempre
-  sujetos a validación fundamental).
-- Filtrar por **riesgo total** y por **condiciones mínimas** de descuento.
-
-> Nada de lo que ves aquí constituye una recomendación de inversión.
-
----
-
-### 2. Barra lateral (filtros principales)
-
-1. **Fecha objetivo**  
-   - Elegís la fecha para la que querés ver las señales.
-   - Solo se muestran fechas donde el motor generó señales.
-
-2. **Filtro de bucket de riesgo (score_total)**  
-   - *Todos*: muestra todo el universo con señal.
-   - *Bajo / Medio / Alto / Muy alto*: restringe las señales según el
-     bucket de `score_total`.  
-       - *Bajo*: escenarios más tranquilos.
-       - *Muy alto*: escenarios más especulativos / volátiles.
-
-3. **Mínimo descuento (%)**  
-   - Cuando en el futuro exista una métrica de descuento explícita,
-     este slider filtrará solo activos con **descuento mínimo** respecto
-     a su referencia.
-   - Mientras tanto, podés dejarlo en `0.00%` para no filtrar nada
-     adicional.
-
-4. **Umbral de sobre-extensión vs MA60 (%)**  
-   - Define qué tan por encima de la media móvil de 60 ruedas (MA60)
-     debe estar el precio para que consideremos una **sobre-extensión
-     alcista**.
-   - Valores sugeridos:
-     - `12%` (default): sobre-extensión moderada.
-     - `15–20%`: sobre-extensión extrema (bordes).
-
----
-
-### 3. Bloque “1. Resumen general”
-
-Te da una foto rápida del universo filtrado:
-
-- **Activos distintos con señal**: cuántos tickers tienen al menos una señal.
-- **Cantidad total de señales**: algunas reglas pueden generar
-  más de una señal por ticker.
-- **Mediana de score_total y VAT3_norm**: te ayudan a entender si la
-  fecha está “tranquila” o “cargada” de riesgo.
-- **Tabla de tendencias**: cuántos activos están etiquetados como
-  *Alcista* (u otras tendencias, si se agregan a futuro).
-
-Si este bloque muestra un mensaje azul informando que no hay señales,
-revisá los filtros: tal vez elegiste una fecha sin señales o
-pusiste filtros demasiado restrictivos.
-
----
-
-### 4. Bloque “2. Señales / Zonas a la fecha seleccionada”
-
-Hay 5 pestañas:
-
-1. **Descuento tranquilo PREMIUM**  
-   - Escenarios de *descuento moderado/alto* + *buen perfil de riesgo*.
-   - Son candidatos naturales para mirar con calma y luego validar
-     con análisis fundamental.
-
-2. **Descuento tranquilo SEMI**  
-   - Parecido al anterior, pero con condiciones algo más laxas.
-   - Útil para ampliar el radar cuando el universo está muy filtrado.
-
-3. **Descuento violento (alto riesgo)**  
-   - Descuentos fuertes en activos con **riesgo muy elevado**.
-   - Territorio especulativo. Se mira, pero no implica acción.
-
-4. **Sobre-extensión alcista**  
-   - Activos *alcistas* y **muy por encima de la MA60** (según el
-     umbral que definas en el slider).
-   - Pueden ser candidatos a:
-     - Toma parcial de ganancias.
-     - Ajuste de stop.
-     - Monitoreo más cercano.
-
-5. **Todas las señales**  
-   - Muestra el conjunto completo para la fecha, ordenado por
-     `score_total` (de mayor a menor).
-   - Útil como “tablero completo” después de explorar las pestañas
-     anteriores.
-
-En todas las pestañas:
-
-- Las tablas muestran:
-  - `ticker`
-  - `trend_label` (por ahora “Alcista”)
-  - `signal_type`
-  - `score_total`
-  - `VAT3_norm`
-  - `dist_MA60_pct` (distancia a MA60 en %)
-  - `discount_pct` (por ahora placeholder)
-  - `discount_risk_ratio` (placeholder para análisis futuro)
-
-Si una pestaña no tiene resultados, se muestra un mensaje azul aclarando
-que no hay activos para esa categoría con los filtros actuales.
-
----
-
-### 5. Cómo usar los “bordes” de señal en la práctica
-
-- **Para buscar entradas posibles**  
-  - Mirar primero *Descuento tranquilo PREMIUM* y *SEMI* con:
-    - Bucket de riesgo en `Bajo` o `Medio`.
-    - Umbral de MA60 en su valor por defecto.
-  - Luego, validar esos tickers con tu análisis fundamental.
-
-- **Para controlar toma de ganancias / sobre-extensión**  
-  - Ir a *Sobre-extensión alcista*.
-  - Subir el umbral de MA60 al rango `15–20%` para ver los casos más
-    extremos.
-  - Revisar esos nombres dentro de tu cartera o watchlist.
-
-Siempre el orden es:
-1. Señal cuantitativa → 2. Validación cualitativa → 3. Decisión.
-
----
-
-### 6. Recordatorio legal
-
-Este viewer:
-
-- No reemplaza el análisis fundamental.
-- No considera tu perfil de riesgo ni tu situación patrimonial.
-- No constituye recomendación de inversión ni asesoramiento financiero.
-
-Tomá todas las salidas como **insumos de análisis**, no como órdenes
-de compra/venta.
-            """
-        )
-
-
-# ---------------------------------------------------------------------------
-# UI principal
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    st.set_page_config(
-        page_title="ACTIVOS-ARGENTINA — Viewer de Zonas Precio / Riesgo",
-        layout="wide",
-        initial_sidebar_state="expanded",
+def _download_button(df: pd.DataFrame, filename: str, label: str):
+    if df is None or df.empty:
+        st.caption("Sin datos para descargar.")
+        return
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label=label,
+        data=csv_bytes,
+        file_name=filename,
+        mime="text/csv",
     )
 
-    st.title("ACTIVOS-ARGENTINA — Viewer de Zonas Precio / Riesgo")
-    st.caption(
-        "Visualización privada de señales estadísticas pre-calculadas. "
-        "El motor de cálculo permanece en el repositorio principal (no visible aquí)."
-    )
+# =============================
+# UI: Header
+# =============================
+st.title(APP_TITLE)
+st.info(DISCLAIMER)
 
-    # Guía de uso dentro de la app
-    render_help()
+col_a, col_b, col_c = st.columns([2, 2, 1])
+with col_a:
+    st.caption(f"Zonas: `{ZONES_PATH}` → {_file_info(ZONES_PATH)}")
+with col_b:
+    st.caption(f"Ranking v0: `{RANKING_PATH}` → {_file_info(RANKING_PATH)}")
+with col_c:
+    if st.button("🔄 Recargar datos (borrar caché)", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
-    # Carga de datos
-    try:
-        df = load_data(str(DATA_FILE))
-    except FileNotFoundError:
-        st.error(f"Error al cargar archivos: No se encontró el archivo: {DATA_FILE}")
-        st.stop()
-    except Exception as e:
-        st.error(f"Error al cargar archivos: {e}")
-        st.stop()
+# =============================
+# Load data
+# =============================
+zones_raw = _read_csv_cached(ZONES_PATH)
+ranking_raw = _read_csv_cached(RANKING_PATH)
 
-    # ------------------------------------------------------------------
-    # Sidebar: parámetros y filtros
-    # ------------------------------------------------------------------
-    with st.sidebar:
-        st.header("Parámetros")
+zones = _add_basic_types_zones(zones_raw)
+ranking = _add_basic_types_ranking(ranking_raw)
 
-        # 🔄 Botón para recargar datos (borrar caché)
-        if st.button("🔄 Recargar datos (borrar caché)"):
-            st.cache_data.clear()
-            st.experimental_rerun()
+tabs = st.tabs(["📍 Zonas (signals_zones_latest)", "🏁 Ranking multifactor v0"])
 
-        # Fechas disponibles (ordenadas de más reciente a más antigua)
-        available_dates = sorted(df["date"].dt.date.unique(), reverse=True)
-        target_date = st.selectbox(
-            "Fecha objetivo",
-            options=available_dates,
-            format_func=lambda d: d.isoformat(),
-        )
+# =============================
+# TAB 1: Zonas
+# =============================
+with tabs[0]:
+    st.subheader("Zonas (signals_zones_latest.csv)")
 
-        st.subheader("Filtro de riesgo\n(score_total)")
-        bucket_options = ["Todos", "Bajo", "Medio", "Alto", "Muy alto"]
-        bucket_filter = st.selectbox("Filtro de bucket:", options=bucket_options)
-
-        st.subheader("Filtros adicionales")
-
-        min_discount = st.slider(
-            "Mínimo descuento (%)",
-            min_value=0.0,
-            max_value=10.0,
-            value=0.0,
-            step=0.25,
-            help=(
-                "Filtra solo activos con un descuento mínimo respecto a su nivel "
-                "de referencia (cuando esa métrica esté disponible)."
-            ),
-        )
-
-        ma60_threshold = st.slider(
-            "Umbral de sobre-extensión vs MA60 (%)",
-            min_value=8.0,
-            max_value=20.0,
-            value=12.0,
-            step=0.25,
-            help=(
-                "Define qué tan por encima de la MA60 debe estar el precio para "
-                "que una señal se considere 'sobre-extensión alcista'."
-            ),
-        )
-
-    # Aplicamos filtros base (fecha, bucket, descuento)
-    df_filtered = base_filter(df, target_date, bucket_filter, min_discount)
-
-    # ------------------------------------------------------------------
-    # 1. Resumen general
-    # ------------------------------------------------------------------
-    st.markdown("### 1. Resumen general")
-
-    if df_filtered.empty:
-        st.info(
-            "No hay señales para los filtros actuales. Ajustá la fecha, "
-            "el bucket de riesgo o el mínimo de descuento para ver resultados."
-        )
+    if zones.empty:
+        st.warning("No hay datos de zonas. Verificá que el archivo exista y tenga contenido.")
     else:
-        col1, col2, col3 = st.columns(3)
+        # Controles
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
 
-        with col1:
-            st.metric(
-                "Activos distintos con señal en la fecha",
-                int(df_filtered["ticker"].nunique()),
-            )
-            st.metric(
-                "Cantidad total de señales en la fecha",
-                int(len(df_filtered)),
-            )
+        with c1:
+            dates = sorted(zones["date"].dropna().dt.date.unique()) if "date" in zones.columns else []
+            date_choice = st.selectbox("Fecha", options=dates[::-1] if dates else [], index=0)
+        with c2:
+            zone_options = ["(todas)"] + sorted([z for z in zones["zone_label"].dropna().unique()]) if "zone_label" in zones.columns else ["(todas)"]
+            zone_choice = st.selectbox("Zona", options=zone_options, index=0)
+        with c3:
+            trend_options = ["(todas)"] + sorted([t for t in zones["trend_label"].dropna().unique()]) if "trend_label" in zones.columns else ["(todas)"]
+            trend_choice = st.selectbox("Trend", options=trend_options, index=0)
+        with c4:
+            search = st.text_input("Buscar ticker (contiene)", value="")
 
-        with col2:
-            st.metric(
-                "Mediana score_total (sobre universo con señal)",
-                round(float(df_filtered["score_total"].median()), 1),
-            )
-            st.metric(
-                "Mediana VAT3_norm (sobre universo con señal)",
-                round(float(df_filtered["VAT3_norm"].median()), 2),
-            )
+        df = zones.copy()
 
-        with col3:
-            st.write("Tendencias entre activos con señal:")
-            trend_counts = (
-                df_filtered.groupby("trend_label")["ticker"]
-                .nunique()
-                .reset_index(name="count")
-            )
-            st.dataframe(trend_counts, use_container_width=True)
+        if "date" in df.columns and dates:
+            df = df[df["date"].dt.date == date_choice]
 
-    # ------------------------------------------------------------------
-    # 2. Señales / Zonas a la fecha seleccionada
-    # ------------------------------------------------------------------
-    st.markdown("### 2. Señales / Zonas a la fecha seleccionada")
+        if "zone_label" in df.columns and zone_choice != "(todas)":
+            df = df[df["zone_label"] == zone_choice]
 
-    (
-        tab_desc_premium,
-        tab_desc_semi,
-        tab_desc_violento,
-        tab_sobre_ext,
-        tab_all,
-    ) = st.tabs(
-        [
-            "Descuento tranquilo PREMIUM",
-            "Descuento tranquilo SEMI",
-            "Descuento violento (alto riesgo)",
-            "Sobre-extensión alcista",
-            "Todas las señales",
+        if "trend_label" in df.columns and trend_choice != "(todas)":
+            df = df[df["trend_label"] == trend_choice]
+
+        if search.strip():
+            if "ticker" in df.columns:
+                df = df[df["ticker"].astype(str).str.contains(search.strip(), case=False, na=False)]
+
+        # Orden sugerido
+        sort_cols = []
+        if "discount_pct" in df.columns:
+            sort_cols.append("discount_pct")
+        if "score_total" in df.columns:
+            sort_cols.append("score_total")
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+
+        st.caption(f"Filas: {len(df)}")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        _download_button(df, "signals_zones_filtered.csv", "⬇️ Descargar CSV filtrado")
+
+# =============================
+# TAB 2: Ranking v0
+# =============================
+with tabs[1]:
+    st.subheader("Ranking multifactor v0 (multifactor_ranking_v0.csv)")
+
+    if ranking.empty:
+        st.warning("No hay datos de ranking. Verificá que el archivo exista y tenga contenido.")
+    else:
+        # Filtro por fecha (debe ser “del día” = última fecha disponible)
+        dates = sorted(ranking["date"].dropna().dt.date.unique()) if "date" in ranking.columns else []
+        default_date = dates[-1] if dates else None
+
+        c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
+
+        with c1:
+            date_choice = st.selectbox("Fecha", options=dates[::-1] if dates else [], index=0)
+        with c2:
+            top_n = st.selectbox("Top N", options=[20, 50, 100, 200, 500], index=1)
+        with c3:
+            only_ok = st.checkbox("Sólo status OK", value=True)
+        with c4:
+            exclude_nd = st.checkbox("Excluir trend ND", value=True)
+        with c5:
+            search = st.text_input("Buscar ticker (contiene)", value="")
+
+        df = ranking.copy()
+
+        if "date" in df.columns and dates:
+            df = df[df["date"].dt.date == date_choice]
+
+        # status OK
+        if only_ok and "status" in df.columns:
+            df = df[df["status"] == "OK"]
+
+        # excluir ND
+        if exclude_nd and "trend_label" in df.columns:
+            df = df[df["trend_label"] != "ND"]
+
+        # búsqueda ticker
+        if search.strip() and "ticker" in df.columns:
+            df = df[df["ticker"].astype(str).str.contains(search.strip(), case=False, na=False)]
+
+        # ordenar por score_total_v0 desc si existe; si no, por rank_v0 asc
+        if "score_total_v0" in df.columns:
+            df = df.sort_values(["score_total_v0"], ascending=False)
+        elif "rank_v0" in df.columns:
+            df = df.sort_values(["rank_v0"], ascending=True)
+
+        # top N
+        df = df.head(int(top_n))
+
+        # Columnas recomendadas para visualización (si existen)
+        preferred_cols = [
+            "date", "ticker", "rank_v0",
+            "score_total_v0", "score_salida_v0",
+            "trend_label", "trend_score_raw", "trend_score_pos",
+            "risk_score_100", "tails_score_100", "liquidity_proxy_score_100",
+            "price_position_score_100", "history_quality_score_100",
+            "zone_label",
+            "close_target", "last_same_level_date", "days_since_same_level",
+            "pos_in_range_60", "pos_in_range_60_score_100",
+            "dist_MA20_pct", "dist_MA60_pct", "dist_MA252_pct",
+            "VAT3_norm", "regime_label",
+            "vol_20d_annual", "vol_60d_annual", "vol_252d_annual", "vol_adaptativa_annual_v3",
         ]
-    )
+        cols = [c for c in preferred_cols if c in df.columns]
+        df_view = df[cols].copy() if cols else df
 
-    # Helper para renderizar cada tab
-    def render_tab(tab, title: str, description: str, df_tab: pd.DataFrame) -> None:
-        with tab:
-            st.subheader(title)
-            st.write(description)
-            if df_tab.empty:
-                st.info("No hay activos en esta categoría con los filtros actuales.")
-            else:
-                st.dataframe(prepare_df(df_tab), use_container_width=True)
+        st.caption(f"Fecha: {date_choice} • Filas mostradas: {len(df_view)}")
+        st.dataframe(df_view, use_container_width=True, hide_index=True)
 
-    # Mapeo de tipos de señal (a futuro el motor puede generar más tipos)
-    df_premium = df_filtered[df_filtered["signal_type"] == "descuento_tranquilo_premium"]
-    df_semi = df_filtered[df_filtered["signal_type"] == "descuento_tranquilo_semi"]
-    df_violento = df_filtered[
-        df_filtered["signal_type"] == "descuento_violento_alto_riesgo"
-    ]
-
-    df_sobre_ext = df_filtered[df_filtered["signal_type"] == "sobre_extension_alcista"]
-    df_sobre_ext = df_sobre_ext[df_sobre_ext["dist_MA60_pct"] >= ma60_threshold]
-
-    df_all = df_filtered.copy()
-
-    # Render de cada tab
-    render_tab(
-        tab_desc_premium,
-        "Descuento tranquilo PREMIUM",
-        (
-            "Alcista + por debajo de MA60 (descuento moderado/alto) + score_total "
-            "elevado (bajo riesgo relativo) + colas suaves. Ordenadas por mejor "
-            "relación descuento / riesgo."
-        ),
-        df_premium,
-    )
-
-    render_tab(
-        tab_desc_semi,
-        "Descuento tranquilo SEMI",
-        (
-            "Señales etiquetadas como descuento tranquilo SEMI en el motor principal. "
-            "También ordenadas por mejor relación descuento / riesgo, pero con "
-            "condiciones algo más laxas."
-        ),
-        df_semi,
-    )
-
-    render_tab(
-        tab_desc_violento,
-        "Descuento violento con riesgo elevado",
-        (
-            "Alcista + fuerte descuento vs MA60 + riesgo muy alto. Escenario "
-            "especulativo y de alta volatilidad."
-        ),
-        df_violento,
-    )
-
-    render_tab(
-        tab_sobre_ext,
-        "Sobre-extensión alcista",
-        (
-            "Alcista + muy por encima de MA60 (umbral configurable) + riesgo "
-            "medio/alto. Posibles candidatos a toma de ganancias o monitoreo cercano."
-        ),
-        df_sobre_ext.sort_values("dist_MA60_pct", ascending=False),
-    )
-
-    render_tab(
-        tab_all,
-        "Todas las señales combinadas",
-        (
-            "Todas las señales de la fecha seleccionada, aplicando los filtros de "
-            "riesgo y descuento configurados en la barra lateral."
-        ),
-        df_all.sort_values("score_total", ascending=False),
-    )
-
-    st.markdown(
-        "---\n"
-        "Notas: los parámetros y percentiles de riesgo se calculan sobre el universo "
-        "de señales disponibles en el archivo actual. Este viewer no reemplaza el "
-        "análisis fundamental ni constituye recomendación de inversión."
-    )
-
-
-if __name__ == "__main__":
-    main()
+        _download_button(df_view, "multifactor_ranking_v0_top.csv", "⬇️ Descargar CSV (Top filtrado)")
