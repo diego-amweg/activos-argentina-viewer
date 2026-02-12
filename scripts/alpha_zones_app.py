@@ -1,253 +1,215 @@
-# /scripts/alpha_zones_app.py
+# scripts/alpha_zones_app.py
 import os
-import time
-from datetime import datetime
-
-import numpy as np
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# =============================
+
+# =========================
 # Config
-# =============================
-st.set_page_config(page_title="Activos Argentina — Zonas + Ranking", layout="wide")
-
-# Data paths (en el repo viewer)
-DATA_DIR = os.path.join("data", "processed")
-ZONES_PATH = os.path.join(DATA_DIR, "signals_zones_latest.csv")
-RANKING_PATH = os.path.join(DATA_DIR, "multifactor_ranking_v0.csv")
-
+# =========================
 APP_TITLE = "Activos Argentina — Zonas + Ranking (Viewer)"
-DISCLAIMER = (
-    "⚠️ **IMPORTANTE:** Este dashboard **NO es una recomendación** ni asesoramiento financiero. "
-    "Es un **orden de prioridad para mirar tickers** y entender contexto (riesgo/tendencia/zonas). "
-    "Toda decisión debe validarse con análisis adicional y tu propio criterio."
+DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "processed"
+
+SIGNALS_CSV = DATA_DIR / "signals_zones_latest.csv"
+RANKING_CSV = DATA_DIR / "multifactor_ranking_v0.csv"
+
+DATE_COL = "date"
+
+# Nota: el ranking NO es recomendación. Es prioridad para mirar tickers.
+DISCLAIMER_RANKING = (
+    "⚠️ **IMPORTANTE**: Este *ranking* **NO es una recomendación de inversión** ni una señal automática. "
+    "Es un **orden de prioridad para revisar tickers** con análisis adicional (cualitativo + contexto + liquidez real)."
 )
 
-# =============================
+DISCLAIMER_GENERAL = (
+    "Este viewer es una herramienta de *análisis* (CFA-friendly + extensiones propias del sistema). "
+    "No constituye asesoramiento financiero."
+)
+
+
+# =========================
 # Helpers
-# =============================
-def _file_info(path: str) -> str:
-    if not os.path.exists(path):
-        return "No encontrado"
-    ts = os.path.getmtime(path)
-    # Mostrar en horario local (Streamlit Cloud suele estar en UTC; igual es informativo)
-    return f"Existe • mtime={datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}"
+# =========================
+def _file_mtime(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+    return float(path.stat().st_mtime)
+
 
 @st.cache_data(show_spinner=False)
-def _read_csv_cached(path: str) -> pd.DataFrame:
-    # Cachea lectura; se limpia con el botón.
-    if not os.path.exists(path):
+def load_csv_cached(path_str: str, mtime: float) -> pd.DataFrame:
+    # mtime se usa SOLO para invalidar cache cuando el archivo cambia
+    return pd.read_csv(path_str)
+
+
+def load_csv(path: Path) -> pd.DataFrame:
+    return load_csv_cached(str(path), _file_mtime(path))
+
+
+def normalize_date_col(df: pd.DataFrame) -> pd.DataFrame:
+    if DATE_COL in df.columns:
+        df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce").dt.date
+    return df
+
+
+def safe_read_signals() -> pd.DataFrame:
+    if not SIGNALS_CSV.exists():
         return pd.DataFrame()
-    return pd.read_csv(path)
-
-def _safe_to_datetime(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
-
-def _as_float(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
-
-def _add_basic_types_zones(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    df = df.copy()
-    if "date" in df.columns:
-        df["date"] = _safe_to_datetime(df["date"])
-    for col in ["dist_MA60_pct", "score_total", "VAT3_norm", "discount_pct", "discount_risk_ratio"]:
-        if col in df.columns:
-            df[col] = _as_float(df[col])
+    df = load_csv(SIGNALS_CSV)
+    df = normalize_date_col(df)
     return df
 
-def _add_basic_types_ranking(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    df = df.copy()
-    if "date" in df.columns:
-        df["date"] = _safe_to_datetime(df["date"])
-    # numéricos típicos del ranking
-    num_cols = [
-        "rank_v0", "score_total_v0", "score_salida_v0",
-        "trend_score_raw", "trend_score_pos",
-        "risk_score_100", "tails_score_100", "liquidity_proxy_score_100",
-        "price_position_score_100", "history_quality_score_100",
-        "close_target", "days_since_same_level",
-        "pos_in_range_60", "pos_in_range_60_score_100",
-        "dist_MA20_pct", "dist_MA60_pct", "dist_MA252_pct",
-        "slope_20_log", "slope_60_log", "slope_252_log",
-        "score_total", "score_vol", "score_tails", "score_illiq", "VAT3_norm",
-        "vol_20d_annual", "vol_60d_annual", "vol_252d_annual", "vol_adaptativa_annual_v3",
-        "pct_days_with_returns",
-    ]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = _as_float(df[c])
-    # last_same_level_date
-    if "last_same_level_date" in df.columns:
-        df["last_same_level_date"] = _safe_to_datetime(df["last_same_level_date"])
+
+def safe_read_ranking() -> pd.DataFrame:
+    if not RANKING_CSV.exists():
+        return pd.DataFrame()
+    df = load_csv(RANKING_CSV)
+    df = normalize_date_col(df)
     return df
 
-def _download_button(df: pd.DataFrame, filename: str, label: str):
-    if df is None or df.empty:
-        st.caption("Sin datos para descargar.")
-        return
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label=label,
-        data=csv_bytes,
-        file_name=filename,
-        mime="text/csv",
-    )
 
-# =============================
-# UI: Header
-# =============================
-st.title(APP_TITLE)
-st.info(DISCLAIMER)
-
-col_a, col_b, col_c = st.columns([2, 2, 1])
-with col_a:
-    st.caption(f"Zonas: `{ZONES_PATH}` → {_file_info(ZONES_PATH)}")
-with col_b:
-    st.caption(f"Ranking v0: `{RANKING_PATH}` → {_file_info(RANKING_PATH)}")
-with col_c:
-    if st.button("🔄 Recargar datos (borrar caché)", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-# =============================
-# Load data
-# =============================
-zones_raw = _read_csv_cached(ZONES_PATH)
-ranking_raw = _read_csv_cached(RANKING_PATH)
-
-zones = _add_basic_types_zones(zones_raw)
-ranking = _add_basic_types_ranking(ranking_raw)
-
-tabs = st.tabs(["📍 Zonas (signals_zones_latest)", "🏁 Ranking multifactor v0"])
-
-# =============================
-# TAB 1: Zonas
-# =============================
-with tabs[0]:
+def render_zones(df: pd.DataFrame) -> None:
     st.subheader("Zonas (signals_zones_latest.csv)")
 
-    if zones.empty:
-        st.warning("No hay datos de zonas. Verificá que el archivo exista y tenga contenido.")
+    if df.empty:
+        st.warning(f"No se encontró o está vacío: {SIGNALS_CSV}")
+        st.stop()
+
+    # Filtros básicos
+    dates = sorted([d for d in df[DATE_COL].dropna().unique().tolist()])
+    default_date = dates[-1] if dates else None
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        selected_date = st.selectbox("Fecha", options=dates, index=len(dates) - 1 if dates else 0)
+    with col2:
+        zone = st.selectbox(
+            "Zona",
+            options=["(todas)"] + sorted([z for z in df.get("zone_label", pd.Series(dtype=str)).dropna().unique().tolist()]),
+            index=0,
+        )
+    with col3:
+        ticker_q = st.text_input("Buscar ticker (contiene)", value="").strip().upper()
+
+    dff = df.copy()
+    if selected_date:
+        dff = dff[dff[DATE_COL] == selected_date]
+
+    if zone != "(todas)" and "zone_label" in dff.columns:
+        dff = dff[dff["zone_label"] == zone]
+
+    if ticker_q and "ticker" in dff.columns:
+        dff = dff[dff["ticker"].astype(str).str.upper().str.contains(ticker_q, na=False)]
+
+    # Orden recomendado: por label y luego por dist/riesgo si existen
+    sort_cols = []
+    if "discount_pct" in dff.columns:
+        sort_cols.append("discount_pct")
+    if "score_total" in dff.columns:
+        sort_cols.append("score_total")
+    if "VAT3_norm" in dff.columns:
+        sort_cols.append("VAT3_norm")
+
+    if sort_cols:
+        dff = dff.sort_values(by=sort_cols, ascending=False)
+
+    st.caption(f"Filas: {len(dff)}")
+    st.dataframe(dff, use_container_width=True)
+
+
+def render_ranking(df: pd.DataFrame) -> None:
+    st.subheader("Ranking v0 (multifactor_ranking_v0.csv)")
+    st.info(DISCLAIMER_RANKING)
+
+    if df.empty:
+        st.warning(f"No se encontró o está vacío: {RANKING_CSV}")
+        st.stop()
+
+    # Fecha (por defecto última)
+    dates = sorted([d for d in df[DATE_COL].dropna().unique().tolist()])
+    default_date = dates[-1] if dates else None
+
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+    with col1:
+        selected_date = st.selectbox("Fecha", options=dates, index=len(dates) - 1 if dates else 0)
+    with col2:
+        top_n = st.selectbox("Top N", options=[20, 50, 100, 200, 500], index=1)
+    with col3:
+        only_ok = st.checkbox("Solo status=OK (si existe)", value=True)
+    with col4:
+        ticker_q = st.text_input("Buscar ticker (contiene)", value="").strip().upper()
+
+    dff = df.copy()
+    if selected_date:
+        dff = dff[dff[DATE_COL] == selected_date]
+
+    if only_ok and "status" in dff.columns:
+        dff = dff[dff["status"].astype(str).str.upper() == "OK"]
+
+    if ticker_q and "ticker" in dff.columns:
+        dff = dff[dff["ticker"].astype(str).str.upper().str.contains(ticker_q, na=False)]
+
+    # Orden por score_total_v0 desc si existe; si no, rank_v0 asc
+    if "score_total_v0" in dff.columns:
+        dff = dff.sort_values(by="score_total_v0", ascending=False)
+    elif "rank_v0" in dff.columns:
+        dff = dff.sort_values(by="rank_v0", ascending=True)
+
+    dff_head = dff.head(int(top_n)) if top_n else dff
+    st.caption(f"Filas (post-filtros): {len(dff)} | Mostrando: {len(dff_head)}")
+
+    # Columnas “de cabecera” sugeridas si existen
+    preferred = [
+        "date",
+        "ticker",
+        "rank_v0",
+        "score_total_v0",
+        "score_salida_v0",
+        "trend_label",
+        "risk_score_100",
+        "tails_score_100",
+        "liquidity_proxy_score_100",
+        "price_position_score_100",
+        "pos_in_range_60_score_100",
+        "close_target",
+        "last_same_level_date",
+        "days_since_same_level",
+        "zone_label",
+    ]
+    cols = [c for c in preferred if c in dff_head.columns]
+    # si faltan, mostramos todo
+    if cols:
+        st.dataframe(dff_head[cols], use_container_width=True)
+        with st.expander("Ver todas las columnas"):
+            st.dataframe(dff_head, use_container_width=True)
     else:
-        # Controles
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+        st.dataframe(dff_head, use_container_width=True)
 
-        with c1:
-            dates = sorted(zones["date"].dropna().dt.date.unique()) if "date" in zones.columns else []
-            date_choice = st.selectbox("Fecha", options=dates[::-1] if dates else [], index=0)
-        with c2:
-            zone_options = ["(todas)"] + sorted([z for z in zones["zone_label"].dropna().unique()]) if "zone_label" in zones.columns else ["(todas)"]
-            zone_choice = st.selectbox("Zona", options=zone_options, index=0)
-        with c3:
-            trend_options = ["(todas)"] + sorted([t for t in zones["trend_label"].dropna().unique()]) if "trend_label" in zones.columns else ["(todas)"]
-            trend_choice = st.selectbox("Trend", options=trend_options, index=0)
-        with c4:
-            search = st.text_input("Buscar ticker (contiene)", value="")
 
-        df = zones.copy()
+# =========================
+# App
+# =========================
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-        if "date" in df.columns and dates:
-            df = df[df["date"].dt.date == date_choice]
+st.title(APP_TITLE)
+st.caption(DISCLAIMER_GENERAL)
 
-        if "zone_label" in df.columns and zone_choice != "(todas)":
-            df = df[df["zone_label"] == zone_choice]
+# Botón para limpiar cache
+colA, colB = st.columns([1, 5])
+with colA:
+    if st.button("🔄 Recargar datos (borrar caché)"):
+        st.cache_data.clear()
+        st.success("Caché borrado. Releyendo datos...")
 
-        if "trend_label" in df.columns and trend_choice != "(todas)":
-            df = df[df["trend_label"] == trend_choice]
+# Lectura datos (con invalidación automática por mtime)
+signals_df = safe_read_signals()
+ranking_df = safe_read_ranking()
 
-        if search.strip():
-            if "ticker" in df.columns:
-                df = df[df["ticker"].astype(str).str.contains(search.strip(), case=False, na=False)]
+tab1, tab2 = st.tabs(["Zonas", "Ranking v0"])
 
-        # Orden sugerido
-        sort_cols = []
-        if "discount_pct" in df.columns:
-            sort_cols.append("discount_pct")
-        if "score_total" in df.columns:
-            sort_cols.append("score_total")
-        if sort_cols:
-            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+with tab1:
+    render_zones(signals_df)
 
-        st.caption(f"Filas: {len(df)}")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        _download_button(df, "signals_zones_filtered.csv", "⬇️ Descargar CSV filtrado")
-
-# =============================
-# TAB 2: Ranking v0
-# =============================
-with tabs[1]:
-    st.subheader("Ranking multifactor v0 (multifactor_ranking_v0.csv)")
-
-    if ranking.empty:
-        st.warning("No hay datos de ranking. Verificá que el archivo exista y tenga contenido.")
-    else:
-        # Filtro por fecha (debe ser “del día” = última fecha disponible)
-        dates = sorted(ranking["date"].dropna().dt.date.unique()) if "date" in ranking.columns else []
-        default_date = dates[-1] if dates else None
-
-        c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
-
-        with c1:
-            date_choice = st.selectbox("Fecha", options=dates[::-1] if dates else [], index=0)
-        with c2:
-            top_n = st.selectbox("Top N", options=[20, 50, 100, 200, 500], index=1)
-        with c3:
-            only_ok = st.checkbox("Sólo status OK", value=True)
-        with c4:
-            exclude_nd = st.checkbox("Excluir trend ND", value=True)
-        with c5:
-            search = st.text_input("Buscar ticker (contiene)", value="")
-
-        df = ranking.copy()
-
-        if "date" in df.columns and dates:
-            df = df[df["date"].dt.date == date_choice]
-
-        # status OK
-        if only_ok and "status" in df.columns:
-            df = df[df["status"] == "OK"]
-
-        # excluir ND
-        if exclude_nd and "trend_label" in df.columns:
-            df = df[df["trend_label"] != "ND"]
-
-        # búsqueda ticker
-        if search.strip() and "ticker" in df.columns:
-            df = df[df["ticker"].astype(str).str.contains(search.strip(), case=False, na=False)]
-
-        # ordenar por score_total_v0 desc si existe; si no, por rank_v0 asc
-        if "score_total_v0" in df.columns:
-            df = df.sort_values(["score_total_v0"], ascending=False)
-        elif "rank_v0" in df.columns:
-            df = df.sort_values(["rank_v0"], ascending=True)
-
-        # top N
-        df = df.head(int(top_n))
-
-        # Columnas recomendadas para visualización (si existen)
-        preferred_cols = [
-            "date", "ticker", "rank_v0",
-            "score_total_v0", "score_salida_v0",
-            "trend_label", "trend_score_raw", "trend_score_pos",
-            "risk_score_100", "tails_score_100", "liquidity_proxy_score_100",
-            "price_position_score_100", "history_quality_score_100",
-            "zone_label",
-            "close_target", "last_same_level_date", "days_since_same_level",
-            "pos_in_range_60", "pos_in_range_60_score_100",
-            "dist_MA20_pct", "dist_MA60_pct", "dist_MA252_pct",
-            "VAT3_norm", "regime_label",
-            "vol_20d_annual", "vol_60d_annual", "vol_252d_annual", "vol_adaptativa_annual_v3",
-        ]
-        cols = [c for c in preferred_cols if c in df.columns]
-        df_view = df[cols].copy() if cols else df
-
-        st.caption(f"Fecha: {date_choice} • Filas mostradas: {len(df_view)}")
-        st.dataframe(df_view, use_container_width=True, hide_index=True)
-
-        _download_button(df_view, "multifactor_ranking_v0_top.csv", "⬇️ Descargar CSV (Top filtrado)")
+with tab2:
+    render_ranking(ranking_df)
